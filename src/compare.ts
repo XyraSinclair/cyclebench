@@ -267,6 +267,11 @@ function makeMutationGuard(inputs: readonly (readonly unknown[])[]): MutationGua
 /* The comparison                                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * The engine, top to bottom — each phase is a named function below, in call
+ * order: cleanPass → partitionAgreement → cells → warmUp → measureFloors →
+ * measuredRun → the guard's final check → buildReport.
+ */
 export async function compare(spec: CompareSpec): Promise<Report> {
     const {
         inputs = [[]],
@@ -287,9 +292,41 @@ export async function compare(spec: CompareSpec): Promise<Report> {
     const eq: (a: unknown, b: unknown) => boolean =
         agree === 'deep' ? isoEqual : agree === 'identity' ? Object.is : agree || (() => true)
 
-    // --- First clean pass: async detection, error capture, agreement results,
-    // and mutation detection (see MutationGuard).
     const guard = makeMutationGuard(inputs)
+    const cands = await cleanPass(entries, inputs, guard)
+
+    const live = cands.filter((c) => !c.error)
+    const { disagreements, disagreeing } =
+        agree === false
+            ? { disagreements: [] as Disagreement[], disagreeing: new Set<string>() }
+            : partitionAgreement(live, inputs.length, eq)
+
+    const cells: Cell[] = []
+    for (const cand of live)
+        for (let i = 0; i < inputs.length; i++)
+            cells.push(makeCell(cand, inputs[i], i, timeMs / inputs.length))
+
+    await warmUp(cells, targetSliceMs, warmupMs / inputs.length)
+    const floorByArity = await measureFloors(cells, targetSliceMs)
+    const floorNs = Math.max(0, ...floorByArity.values())
+    await measuredRun(cells, targetSliceMs, deopt)
+
+    guard.afterRun()
+    sink.fill(undefined) // don't retain candidate outputs after the run
+
+    return buildReport(cands, cells, inputs.length, floorNs, floorByArity, disagreements, disagreeing, agree)
+}
+
+/**
+ * First clean pass: async detection, error capture, one result per input for
+ * the agreement check, and mutation detection (see MutationGuard). No timing
+ * happens here; these calls are the ones whose results get cross-validated.
+ */
+async function cleanPass(
+    entries: readonly [string, AnyFn][],
+    inputs: readonly (readonly unknown[])[],
+    guard: MutationGuard
+): Promise<Cand[]> {
     const cands: Cand[] = []
     for (const [name, fn] of entries) {
         const cand: Cand = { name, fn, isAsync: false, agreementResults: [] }
@@ -308,52 +345,57 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         guard.afterCandidate(name)
         cands.push(cand)
     }
+    return cands
+}
 
-    // --- Agreement: per input, partition candidates into equality classes.
-    // NOTE: a custom `agree` predicate must be an equivalence relation;
-    // tolerance predicates are not transitive and make the partition
-    // insertion-order-dependent.
-    const live = cands.filter((c) => !c.error)
+/**
+ * Agreement: per input, partition candidates into equality classes.
+ * NOTE: a custom `agree` predicate must be an equivalence relation;
+ * tolerance predicates are not transitive and make the partition
+ * insertion-order-dependent.
+ */
+function partitionAgreement(
+    live: readonly Cand[],
+    inputCount: number,
+    eq: (a: unknown, b: unknown) => boolean
+): { disagreements: Disagreement[]; disagreeing: Set<string> } {
     const disagreements: Disagreement[] = []
     const disagreeing = new Set<string>()
-    if (agree !== false) {
-        for (let i = 0; i < inputs.length; i++) {
-            const classes: { rep: unknown; names: string[] }[] = []
-            for (const cand of live) {
-                const r = cand.agreementResults[i]
-                const cls = classes.find((c) => eq(c.rep, r))
-                if (cls) cls.names.push(cand.name)
-                else classes.push({ rep: r, names: [cand.name] })
-            }
-            if (classes.length > 1) {
-                classes.sort((a, b) => b.names.length - a.names.length)
-                disagreements.push({ inputIndex: i, classes: classes.map((c) => c.names) })
-                // A strict majority class is presumed right and only the rest
-                // are flagged; when the top classes tie in size there is no
-                // majority to bless — flag every class rather than letting
-                // insertion order pick a winner.
-                const tied = classes[0].names.length === classes[1].names.length
-                for (const cls of tied ? classes : classes.slice(1))
-                    for (const n of cls.names) disagreeing.add(n)
-            }
+    for (let i = 0; i < inputCount; i++) {
+        const classes: { rep: unknown; names: string[] }[] = []
+        for (const cand of live) {
+            const r = cand.agreementResults[i]
+            const cls = classes.find((c) => eq(c.rep, r))
+            if (cls) cls.names.push(cand.name)
+            else classes.push({ rep: r, names: [cand.name] })
+        }
+        if (classes.length > 1) {
+            classes.sort((a, b) => b.names.length - a.names.length)
+            disagreements.push({ inputIndex: i, classes: classes.map((c) => c.names) })
+            // A strict majority class is presumed right and only the rest
+            // are flagged; when the top classes tie in size there is no
+            // majority to bless — flag every class rather than letting
+            // insertion order pick a winner.
+            const tied = classes[0].names.length === classes[1].names.length
+            for (const cls of tied ? classes : classes.slice(1))
+                for (const n of cls.names) disagreeing.add(n)
         }
     }
+    return { disagreements, disagreeing }
+}
 
-    // --- Cells, warmup, calibration. (Warmup is sequential per cell — only
-    // the measured run below interleaves; warmup time is never counted.)
-    // A candidate that survived the clean pass but throws on a later call
-    // is captured here the same way as in the measured loop: failure is
-    // data, not a crash.
-    const cells: Cell[] = []
-    for (const cand of live)
-        for (let i = 0; i < inputs.length; i++)
-            cells.push(makeCell(cand, inputs[i], i, timeMs / inputs.length))
-    const warmupPerCell = warmupMs / inputs.length
+/**
+ * Calibration + JIT warmup, sequential per cell — only the measured run
+ * interleaves, and warmup time is never counted. A candidate that survived
+ * the clean pass but throws on a later call is captured here the same way
+ * as in the measured run: failure is data, not a crash.
+ */
+async function warmUp(cells: readonly Cell[], targetSliceMs: number, warmupPerCellMs: number): Promise<void> {
     for (const cell of cells) {
         if (cell.cand.error) continue
         try {
-            await calibrate(cell, targetSliceMs, warmupPerCell)
-            while (cell.measuredMs < warmupPerCell) {
+            await calibrate(cell, targetSliceMs, warmupPerCellMs)
+            while (cell.measuredMs < warmupPerCellMs) {
                 cell.measuredMs += cell.cand.isAsync
                     ? await timeSliceAsync(cell, cell.k)
                     : timeSlice(cell, cell.k)
@@ -363,17 +405,21 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         }
         cell.measuredMs = 0 // warmup spent; measurement starts clean
     }
+}
 
-    // --- Harness floor, per arity, measured AFTER warmup so each arity's
-    // call site is in the same inline-cache state the candidates face. A
-    // floor taken through a virgin (monomorphic, inlined) runner understates
-    // real overhead ~7×, which would let unmeasurably small candidates pass
-    // uncaveated. Each used arity is first polymorphized with two distinct
-    // empty functions, then timed with a third.
-    // Polymorphization needs distinct function IDENTITIES at the call site,
-    // not arity-matched formals (a plain call ignores extra args) — fresh
-    // closures do the job with no code generation, so CSP/no-eval runtimes
-    // keep working (the trampoline itself already falls back to apply).
+/**
+ * Harness floor, per used arity, measured AFTER warmup so each arity's call
+ * site is in the same inline-cache state the candidates face. A floor taken
+ * through a virgin (monomorphic, inlined) runner understates real overhead
+ * ~7×, which would let unmeasurably small candidates pass uncaveated. Each
+ * used arity is first polymorphized with two distinct empty functions, then
+ * timed with a third.
+ * Polymorphization needs distinct function IDENTITIES at the call site, not
+ * arity-matched formals (a plain call ignores extra args) — fresh closures
+ * do the job with no code generation, so CSP/no-eval runtimes keep working
+ * (the trampoline itself already falls back to apply).
+ */
+async function measureFloors(cells: readonly Cell[], targetSliceMs: number): Promise<Map<number, number>> {
     const freshEmpty = (): AnyFn => () => {}
     const floorByArity = new Map<number, number>()
     for (const arity of new Set(cells.map((c) => c.args.length))) {
@@ -394,12 +440,16 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         }
         floorByArity.set(arity, quartiles(floorCell.samples).med)
     }
-    const floorNs = Math.max(0, ...floorByArity.values())
+    return floorByArity
+}
 
-    // --- The measured run: round-robin over every (candidate × input) cell.
-    // Interleaving is the point — background load, thermal state, and GC
-    // pressure drift on the scale of tens of milliseconds; slices of ~2ms
-    // visited round-robin expose every candidate to the same weather.
+/**
+ * The measured run: round-robin over every (candidate × input) cell.
+ * Interleaving is the point — background load, thermal state, and GC
+ * pressure drift on the scale of tens of milliseconds; slices of ~2ms
+ * visited round-robin expose every candidate to the same weather.
+ */
+async function measuredRun(cells: readonly Cell[], targetSliceMs: number, deopt: boolean): Promise<void> {
     const pending = cells.filter((c) => !c.cand.error)
     for (let turn = 0; pending.length > 0; turn++) {
         const cell = pending[turn % pending.length]
@@ -425,12 +475,6 @@ export async function compare(spec: CompareSpec): Promise<Report> {
             cell.k = Math.max(1, Math.min(MAX_K, Math.round((cell.k * targetSliceMs) / Math.max(dt, 1e-6))))
         if (cell.measuredMs >= cell.budgetMs) pending.splice(pending.indexOf(cell), 1)
     }
-
-    guard.afterRun()
-
-    sink.fill(undefined) // don't retain candidate outputs after the run
-
-    return buildReport(cands, cells, inputs.length, floorNs, floorByArity, disagreements, disagreeing, agree)
 }
 
 function makeCell(cand: Cand, args: readonly unknown[], inputIndex: number, budgetMs: number): Cell {
