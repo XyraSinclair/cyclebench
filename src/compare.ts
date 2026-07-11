@@ -197,6 +197,73 @@ async function calibrate(cell: Cell, targetSliceMs: number, deadlineMs: number):
 }
 
 /* ------------------------------------------------------------------ */
+/* Mutation guard                                                      */
+/* ------------------------------------------------------------------ */
+
+// Every cell shares the caller's input arrays (cloning per call would put
+// an unbounded, allocation-shaped cost inside the measurement), so a
+// candidate that mutates its arguments corrupts every later slice. The
+// guard is a three-state protocol over the inputs:
+//
+//   stable      — two honest snapshots agree: armed. Any later divergence
+//                 is mutation, and a detected mutation THROWS — a corrupted
+//                 comparison must not exist, even labeled.
+//   volatile    — two honest snapshots differ (a getter that reads a clock,
+//                 say): mutation is indistinguishable from volatility, so
+//                 the guard disarms rather than blame a candidate.
+//   uncloneable — structuredClone refuses (functions, WeakRefs): disarmed.
+//                 EXCEPT once armed: inputs that stop being cloneable were
+//                 mutated (something inserted a function, say) — that is
+//                 treated as mutation, not as grounds to disarm, so a
+//                 mutation cannot disable its own detector.
+//
+// Snapshots are compared clone-to-clone, so structuredClone's
+// prototype-stripping cancels out.
+interface MutationGuard {
+    /** After one candidate's clean-pass calls — throws naming the culprit. */
+    afterCandidate(name: string): void
+    /** After all measurement — catches mutate-only-on-repeated-calls; the culprit is unknowable this late. */
+    afterRun(): void
+}
+
+function makeMutationGuard(inputs: readonly (readonly unknown[])[]): MutationGuard {
+    const snapshot = (): unknown => {
+        try {
+            return structuredClone(inputs)
+        } catch {
+            return undefined
+        }
+    }
+    let baseline = snapshot()
+    if (baseline !== undefined) {
+        const second = snapshot()
+        if (second === undefined || !isoEqual(baseline, second)) baseline = undefined // volatile
+    }
+    return {
+        afterCandidate(name) {
+            if (baseline === undefined) return
+            const after = snapshot()
+            if (after === undefined || !isoEqual(baseline, after))
+                throw new Error(
+                    `cyclebench: candidate "${name}" mutates its inputs — every ` +
+                        `later measurement would run on corrupted data. Copy inside ` +
+                        `the candidate (e.g. [...xs].sort(...)) instead.`
+                )
+            baseline = after
+        },
+        afterRun() {
+            if (baseline === undefined) return
+            const final = snapshot()
+            if (final === undefined || !isoEqual(baseline, final))
+                throw new Error(
+                    'cyclebench: the inputs were mutated during measurement — some ' +
+                        'candidate mutates on repeated calls; the comparison is invalid.'
+                )
+        },
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* The comparison                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -221,27 +288,8 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         agree === 'deep' ? isoEqual : agree === 'identity' ? Object.is : agree || (() => true)
 
     // --- First clean pass: async detection, error capture, agreement results,
-    // and mutation detection. A candidate that mutates its arguments would
-    // corrupt every subsequent measurement (all cells share the input arrays),
-    // so a comparison containing one is invalid and the run refuses to
-    // continue. Snapshots are compared clone-to-clone, so structuredClone's
-    // prototype-stripping cancels out; uncloneable inputs (functions, etc.)
-    // skip the check.
-    const snapshot = (): unknown => {
-        try {
-            return structuredClone(inputs)
-        } catch {
-            return undefined
-        }
-    }
-    let beforeSnapshot = snapshot()
-    // Inputs with volatile getters serialize differently on every read; two
-    // honest snapshots differing means the check cannot distinguish
-    // volatility from mutation — disable it rather than blame a candidate.
-    if (beforeSnapshot !== undefined) {
-        const second = snapshot()
-        if (second === undefined || !isoEqual(beforeSnapshot, second)) beforeSnapshot = undefined
-    }
+    // and mutation detection (see MutationGuard).
+    const guard = makeMutationGuard(inputs)
     const cands: Cand[] = []
     for (const [name, fn] of entries) {
         const cand: Cand = { name, fn, isAsync: false, agreementResults: [] }
@@ -257,19 +305,7 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         } catch (error) {
             cand.error = error
         }
-        if (beforeSnapshot !== undefined) {
-            // Cloneable before this candidate but not after (it inserted a
-            // function, say) is itself proof of mutation — treat it as one
-            // rather than letting the mutation disable its own detector.
-            const afterSnapshot = snapshot()
-            if (afterSnapshot === undefined || !isoEqual(beforeSnapshot, afterSnapshot))
-                throw new Error(
-                    `cyclebench: candidate "${name}" mutates its inputs — every ` +
-                        `later measurement would run on corrupted data. Copy inside ` +
-                        `the candidate (e.g. [...xs].sort(...)) instead.`
-                )
-            beforeSnapshot = afterSnapshot
-        }
+        guard.afterCandidate(name)
         cands.push(cand)
     }
 
@@ -390,17 +426,7 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         if (cell.measuredMs >= cell.budgetMs) pending.splice(pending.indexOf(cell), 1)
     }
 
-    // A candidate can also mutate only on repeated calls (stateful); one
-    // final snapshot catches that. The culprit is unknowable this late, but
-    // a corrupted comparison must not ship.
-    if (beforeSnapshot !== undefined) {
-        const finalSnapshot = snapshot()
-        if (finalSnapshot === undefined || !isoEqual(beforeSnapshot, finalSnapshot))
-            throw new Error(
-                'cyclebench: the inputs were mutated during measurement — some ' +
-                    'candidate mutates on repeated calls; the comparison is invalid.'
-            )
-    }
+    guard.afterRun()
 
     sink.fill(undefined) // don't retain candidate outputs after the run
 
