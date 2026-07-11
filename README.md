@@ -90,6 +90,11 @@ as unmeasurable rather than ranking it.
   cyclebench would rather say "same" than invent a 3% winner.
 - **Failure is data**: a throwing candidate is reported with its error and
   excluded from ranking; the run survives.
+- **Mutation is refused**: all cells share the input arrays, so a candidate
+  that mutates its arguments (an in-place `xs.sort()`) would corrupt every
+  later measurement. cyclebench snapshots the inputs, detects the mutation,
+  and throws with the culprit's name instead of shipping a corrupted
+  ranking. Benchmark in-place algorithms by copying inside the candidate.
 
 ## API
 

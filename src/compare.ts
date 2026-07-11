@@ -214,7 +214,21 @@ export async function compare(spec: CompareSpec): Promise<Report> {
     const eq: (a: unknown, b: unknown) => boolean =
         agree === 'deep' ? isoEqual : agree === 'identity' ? Object.is : agree || (() => true)
 
-    // --- First clean pass: async detection, error capture, agreement results.
+    // --- First clean pass: async detection, error capture, agreement results,
+    // and mutation detection. A candidate that mutates its arguments would
+    // corrupt every subsequent measurement (all cells share the input arrays),
+    // so a comparison containing one is invalid and the run refuses to
+    // continue. Snapshots are compared clone-to-clone, so structuredClone's
+    // prototype-stripping cancels out; uncloneable inputs (functions, etc.)
+    // skip the check.
+    const snapshot = (): unknown => {
+        try {
+            return structuredClone(inputs)
+        } catch {
+            return undefined
+        }
+    }
+    let beforeSnapshot = snapshot()
     const cands: Cand[] = []
     for (const [name, fn] of entries) {
         const cand: Cand = { name, fn, isAsync: false, agreementResults: [] }
@@ -229,6 +243,16 @@ export async function compare(spec: CompareSpec): Promise<Report> {
             }
         } catch (error) {
             cand.error = error
+        }
+        if (beforeSnapshot !== undefined) {
+            const afterSnapshot = snapshot()
+            if (afterSnapshot !== undefined && !isoEqual(beforeSnapshot, afterSnapshot))
+                throw new Error(
+                    `cyclebench: candidate "${name}" mutates its inputs — every ` +
+                        `later measurement would run on corrupted data. Copy inside ` +
+                        `the candidate (e.g. [...xs].sort(...)) instead.`
+                )
+            beforeSnapshot = afterSnapshot ?? beforeSnapshot
         }
         cands.push(cand)
     }

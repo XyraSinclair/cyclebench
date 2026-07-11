@@ -96,6 +96,22 @@ not a silent pass).
 The agreement pass doubles as the DCE anchor: results that were compared
 for equality are results the engine had to actually produce.
 
+### Mutation
+
+Every cell shares the caller's input arrays — cloning per call would put an
+unbounded, allocation-shaped cost inside the measurement. The consequence:
+a candidate that mutates its arguments (in-place sort, splice, property
+write) corrupts every subsequent slice *and* every other candidate's data.
+This is a validity trap most harnesses silently fall into (the in-place
+sort measures "sorting an already-sorted array" from call two onward).
+cyclebench snapshots the inputs with `structuredClone` before the clean
+pass and re-snapshots after each candidate's first calls; snapshots are
+compared clone-to-clone (so structuredClone's prototype-stripping affects
+both sides equally), and a detected mutation **throws**, naming the
+culprit — a corrupted comparison should not exist, even labeled.
+Uncloneable inputs (functions, WeakRefs) skip the check; that limitation
+is accepted rather than worked around with a weaker fingerprint.
+
 ### Aggregation across inputs
 
 Per-input medians are the ground truth and are always reported. The headline

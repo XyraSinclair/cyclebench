@@ -154,6 +154,28 @@ describe('inputs as a suite', () => {
     it('rejects an empty input suite', async () => {
         await expect(compare({ candidates: { f: () => 1 }, inputs: [] })).rejects.toThrow()
     })
+
+    it('refuses to run a candidate that mutates its inputs', async () => {
+        await expect(
+            compare({
+                candidates: {
+                    copying: (xs: number[]) => [...xs].sort((a, b) => a - b),
+                    inPlace: (xs: number[]) => xs.sort((a, b) => a - b),
+                },
+                inputs: [[[3, 1, 2]]],
+                ...FAST,
+            })
+        ).rejects.toThrow(/inPlace.*mutates/)
+    })
+
+    it('mutation detection skips uncloneable inputs rather than failing', async () => {
+        const report = await compare({
+            candidates: { call: (f: () => number) => f() },
+            inputs: [[() => 42]],
+            ...FAST,
+        })
+        expect(report.candidates[0].calls).toBeGreaterThan(0)
+    })
 })
 
 describe('async', () => {
