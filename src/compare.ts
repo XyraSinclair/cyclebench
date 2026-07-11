@@ -52,7 +52,11 @@ export interface CandidateResult {
     calls: number
     measuredMs: number
     perInput: InputStats[]
-    /** ×fastest — 1 for the winner. */
+    /**
+     * Ratio to the fastest UNcaveated candidate (1 marks that baseline).
+     * A caveated candidate ranked first can carry a value below 1 — a
+     * ratio to harness noise would mean nothing, so it is never the base.
+     */
     vsFastest: number
     /** Ranked adjacent and quartile bands overlap — do not read order as a verdict. */
     tiedWithNext: boolean
