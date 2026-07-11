@@ -1,0 +1,54 @@
+{
+    "name": "cyclebench",
+    "version": "0.1.0",
+    "description": "Comparative benchmarking that interleaves candidates to cancel machine drift, cross-validates their results, and refuses to crown a function that computes the wrong thing.",
+    "keywords": [
+        "benchmark",
+        "benchmarking",
+        "microbenchmark",
+        "performance",
+        "compare",
+        "interleaved",
+        "drift",
+        "verification",
+        "ops-per-second"
+    ],
+    "license": "MIT",
+    "author": "Xyra Sinclair",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/XyraSinclair/cyclebench.git"
+    },
+    "type": "module",
+    "sideEffects": false,
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "files": [
+        "dist",
+        "DESIGN.md"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "test": "vitest run",
+        "probe": "node probes/drift.mjs && node probes/disagreement.mjs && node probes/dce.mjs",
+        "release": "npm publish --access public",
+        "prepublishOnly": "npm run test && npm run build"
+    },
+    "dependencies": {
+        "isoequal": "^0.1.0"
+    },
+    "devDependencies": {
+        "@types/node": "^26.1.0",
+        "typescript": "^5.5.0",
+        "vitest": "^1.6.0"
+    }
+}
