@@ -131,8 +131,14 @@ pass and re-snapshots after each candidate's first calls; snapshots are
 compared clone-to-clone (so structuredClone's prototype-stripping affects
 both sides equally), and a detected mutation **throws**, naming the
 culprit — a corrupted comparison should not exist, even labeled.
-Uncloneable inputs (functions, WeakRefs) skip the check; that limitation
-is accepted rather than worked around with a weaker fingerprint.
+Uncloneable inputs (functions, WeakRefs) skip the check, as do volatile
+inputs (two honest pre-run snapshots that already differ — a getter
+reading a clock — make mutation indistinguishable from volatility); those
+limitations are accepted rather than worked around with a weaker
+fingerprint. One asymmetry is deliberate: inputs that *stop* being
+cloneable after a candidate's calls were mutated (something inserted a
+function), so that case throws rather than disarming — a mutation cannot
+disable its own detector.
 
 ### Aggregation across inputs
 
@@ -197,8 +203,9 @@ Every claim above is executable:
 - `probes/disagreement.mjs` — the numeric-vs-lexicographic sort trap;
   ranking refused.
 - `probes/dce.mjs` — the naive 0.41ns "addition"; floor measured and shown.
-- `src/compare.test.ts` — 22 cases: ranking, agreement classes (including
+- `src/compare.test.ts` — 24 cases: ranking, agreement classes (including
   the no-majority tie), async, failure isolation (clean-pass and
   late-throwing candidates), mutation detection (including the
   uncloneable-insertion and mutate-on-repeat evasions), floor caveats,
-  suite aggregation, formatting.
+  suite aggregation, report printing (including errored rows), the result
+  ring being cleared after a run, formatting.
