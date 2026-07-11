@@ -31,6 +31,8 @@ export interface CompareSpec {
 }
 
 export interface InputStats {
+    /** Index into the spec's `inputs` (perInput can be sparse after an error). */
+    inputIndex: number
     /** ns per call: median and quartile band across measured slices. */
     nsPerOp: number
     band: Quartiles
@@ -245,21 +247,28 @@ export async function compare(spec: CompareSpec): Promise<Report> {
             cand.error = error
         }
         if (beforeSnapshot !== undefined) {
+            // Cloneable before this candidate but not after (it inserted a
+            // function, say) is itself proof of mutation — treat it as one
+            // rather than letting the mutation disable its own detector.
             const afterSnapshot = snapshot()
-            if (afterSnapshot !== undefined && !isoEqual(beforeSnapshot, afterSnapshot))
+            if (afterSnapshot === undefined || !isoEqual(beforeSnapshot, afterSnapshot))
                 throw new Error(
                     `cyclebench: candidate "${name}" mutates its inputs — every ` +
                         `later measurement would run on corrupted data. Copy inside ` +
                         `the candidate (e.g. [...xs].sort(...)) instead.`
                 )
-            beforeSnapshot = afterSnapshot ?? beforeSnapshot
+            beforeSnapshot = afterSnapshot
         }
         cands.push(cand)
     }
 
     // --- Agreement: per input, partition candidates into equality classes.
+    // NOTE: a custom `agree` predicate must be an equivalence relation;
+    // tolerance predicates are not transitive and make the partition
+    // insertion-order-dependent.
     const live = cands.filter((c) => !c.error)
     const disagreements: Disagreement[] = []
+    const disagreeing = new Set<string>()
     if (agree !== false) {
         for (let i = 0; i < inputs.length; i++) {
             const classes: { rep: unknown; names: string[] }[] = []
@@ -272,42 +281,78 @@ export async function compare(spec: CompareSpec): Promise<Report> {
             if (classes.length > 1) {
                 classes.sort((a, b) => b.names.length - a.names.length)
                 disagreements.push({ inputIndex: i, classes: classes.map((c) => c.names) })
+                // A strict majority class is presumed right and only the rest
+                // are flagged; when the top classes tie in size there is no
+                // majority to bless — flag every class rather than letting
+                // insertion order pick a winner.
+                const tied = classes[0].names.length === classes[1].names.length
+                for (const cls of tied ? classes : classes.slice(1))
+                    for (const n of cls.names) disagreeing.add(n)
             }
         }
     }
-    const disagreeing = new Set(disagreements.flatMap((d) => d.classes.slice(1).flat()))
 
-    // --- Harness floor: an empty function under the same machinery.
-    const floorCell = makeCell({ name: '', fn: () => {}, isAsync: false, agreementResults: [] }, [], 0, 0)
-    await calibrate(floorCell, targetSliceMs, 25)
-    for (let spent = 0; spent < 30; ) {
-        const dt = timeSlice(floorCell, floorCell.k)
-        floorCell.samples.push((dt * 1e6) / floorCell.k)
-        spent += dt
-    }
-    const floorNs = quartiles(floorCell.samples).med
-
-    // --- Warmup + calibration, interleaved like the real run.
+    // --- Cells, warmup, calibration. (Warmup is sequential per cell — only
+    // the measured run below interleaves; warmup time is never counted.)
+    // A candidate that survived the clean pass but throws on a later call
+    // is captured here the same way as in the measured loop: failure is
+    // data, not a crash.
     const cells: Cell[] = []
     for (const cand of live)
         for (let i = 0; i < inputs.length; i++)
             cells.push(makeCell(cand, inputs[i], i, timeMs / inputs.length))
     const warmupPerCell = warmupMs / inputs.length
-    for (const cell of cells) await calibrate(cell, targetSliceMs, warmupPerCell)
     for (const cell of cells) {
-        while (cell.measuredMs < warmupPerCell) {
-            cell.measuredMs += cell.cand.isAsync
-                ? await timeSliceAsync(cell, cell.k)
-                : timeSlice(cell, cell.k)
+        if (cell.cand.error) continue
+        try {
+            await calibrate(cell, targetSliceMs, warmupPerCell)
+            while (cell.measuredMs < warmupPerCell) {
+                cell.measuredMs += cell.cand.isAsync
+                    ? await timeSliceAsync(cell, cell.k)
+                    : timeSlice(cell, cell.k)
+            }
+        } catch (error) {
+            cell.cand.error = error
         }
         cell.measuredMs = 0 // warmup spent; measurement starts clean
     }
+
+    // --- Harness floor, per arity, measured AFTER warmup so each arity's
+    // call site is in the same inline-cache state the candidates face. A
+    // floor taken through a virgin (monomorphic, inlined) runner understates
+    // real overhead ~7×, which would let unmeasurably small candidates pass
+    // uncaveated. Each used arity is first polymorphized with two distinct
+    // empty functions, then timed with a third.
+    const emptyOfArity = (arity: number): AnyFn => {
+        const params = Array.from({ length: arity }, (_, j) => `x${j}`)
+        return new Function(...params, '') as AnyFn
+    }
+    const floorByArity = new Map<number, number>()
+    for (const arity of new Set(cells.map((c) => c.args.length))) {
+        const dummyArgs = new Array(arity).fill(0)
+        const run = sliceRunner(arity)
+        for (let i = 0; i < 2; i++) run(emptyOfArity(arity), dummyArgs, sink, 10_000)
+        const floorCell = makeCell(
+            { name: '', fn: emptyOfArity(arity), isAsync: false, agreementResults: [] },
+            dummyArgs,
+            0,
+            0
+        )
+        await calibrate(floorCell, targetSliceMs, 25)
+        for (let spent = 0; spent < 25; ) {
+            const dt = timeSlice(floorCell, floorCell.k)
+            floorCell.samples.push((dt * 1e6) / floorCell.k)
+            spent += dt
+        }
+        floorByArity.set(arity, quartiles(floorCell.samples).med)
+    }
+    const floorNs = Math.max(0, ...floorByArity.values())
 
     // --- The measured run: round-robin over every (candidate × input) cell.
     // Interleaving is the point — background load, thermal state, and GC
     // pressure drift on the scale of tens of milliseconds; slices of ~2ms
     // visited round-robin expose every candidate to the same weather.
-    const pending = cells.slice()
+    const pending = cells.filter((c) => !c.cand.error)
     for (let turn = 0; pending.length > 0; turn++) {
         const cell = pending[turn % pending.length]
         // eslint-disable-next-line no-eval
@@ -324,10 +369,30 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         cell.samples.push((dt * 1e6) / cell.k)
         cell.calls += cell.k
         cell.measuredMs += dt
+        // Interleaving must be fair in TIME, not turns: if a slice drifted
+        // from the target (calibration ran on a colder JIT tier, or the
+        // machine changed), rescale k so every cell keeps taking ~equal,
+        // ~target-sized turns. This also stops budget overshoot.
+        if (dt > targetSliceMs * 2 || dt < targetSliceMs * 0.5)
+            cell.k = Math.max(1, Math.min(MAX_K, Math.round((cell.k * targetSliceMs) / Math.max(dt, 1e-6))))
         if (cell.measuredMs >= cell.budgetMs) pending.splice(pending.indexOf(cell), 1)
     }
 
-    return buildReport(cands, cells, inputs.length, floorNs, disagreements, disagreeing, agree)
+    // A candidate can also mutate only on repeated calls (stateful); one
+    // final snapshot catches that. The culprit is unknowable this late, but
+    // a corrupted comparison must not ship.
+    if (beforeSnapshot !== undefined) {
+        const finalSnapshot = snapshot()
+        if (finalSnapshot === undefined || !isoEqual(beforeSnapshot, finalSnapshot))
+            throw new Error(
+                'cyclebench: the inputs were mutated during measurement — some ' +
+                    'candidate mutates on repeated calls; the comparison is invalid.'
+            )
+    }
+
+    sink.fill(undefined) // don't retain candidate outputs after the run
+
+    return buildReport(cands, cells, inputs.length, floorNs, floorByArity, disagreements, disagreeing, agree)
 }
 
 function makeCell(cand: Cand, args: readonly unknown[], inputIndex: number, budgetMs: number): Cell {
@@ -353,6 +418,7 @@ function buildReport(
     cells: Cell[],
     inputCount: number,
     floorNs: number,
+    floorByArity: Map<number, number>,
     disagreements: Disagreement[],
     disagreeing: Set<string>,
     agree: AgreeMode
@@ -361,34 +427,47 @@ function buildReport(
         const own = cells.filter((c) => c.cand === cand && c.samples.length > 0)
         const perInput: InputStats[] = own.map((c) => {
             const band = quartiles(c.samples)
-            return { nsPerOp: band.med, band, calls: c.calls, measuredMs: c.measuredMs }
+            return {
+                inputIndex: c.inputIndex,
+                nsPerOp: band.med,
+                band,
+                calls: c.calls,
+                measuredMs: c.measuredMs,
+            }
         })
         // Equal weight per input: the suite defines the workload, the mean
         // preserves "total time across the suite" — see DESIGN.md.
         const mean = (f: (s: InputStats) => number) =>
             perInput.reduce((t, s) => t + f(s), 0) / (perInput.length || 1)
-        const nsPerOp = mean((s) => s.nsPerOp)
+        const nsPerOp = cand.error && perInput.length === 0 ? NaN : mean((s) => s.nsPerOp)
+        // Each cell answers to its own arity's floor (different arities have
+        // genuinely different call overhead).
+        const atFloor = own.some(
+            (c) => quartiles(c.samples).med < (floorByArity.get(c.args.length) ?? floorNs) * 2
+        )
         return {
             name: cand.name,
             isAsync: cand.isAsync,
             error: cand.error,
             nsPerOp,
-            opsPerSec: nsPerOp > 0 ? 1e9 / nsPerOp : Infinity,
+            opsPerSec: nsPerOp > 0 ? 1e9 / nsPerOp : NaN,
             band: { q1: mean((s) => s.band.q1), med: nsPerOp, q3: mean((s) => s.band.q3) },
             calls: perInput.reduce((t, s) => t + s.calls, 0),
             measuredMs: perInput.reduce((t, s) => t + s.measuredMs, 0),
             perInput,
-            vsFastest: 1,
+            vsFastest: cand.error ? NaN : 1,
             tiedWithNext: false,
             agrees: cand.error || agree === false ? null : !disagreeing.has(cand.name),
             caveat:
-                !cand.error && nsPerOp < floorNs * 2
+                !cand.error && atFloor
                     ? `within 2× of the ${floorNs.toFixed(2)}ns harness floor — call too small to compare reliably; give it bigger work`
                     : undefined,
         }
     })
 
-    results.sort((a, b) => Number(!!a.error) - Number(!!b.error) || a.nsPerOp - b.nsPerOp)
+    results.sort(
+        (a, b) => Number(!!a.error) - Number(!!b.error) || a.nsPerOp - b.nsPerOp || 0
+    )
     const fastest = results.find((r) => !r.error)
     for (const r of results) {
         if (!r.error && fastest) r.vsFastest = r.nsPerOp / fastest.nsPerOp
@@ -413,8 +492,15 @@ function buildReport(
         },
         toJSON() {
             const { candidates, inputCount, floorNs, disagreements, ok } = this
+            const finite = (x: number) => (Number.isFinite(x) ? x : null)
             return {
-                candidates: candidates.map((c) => ({ ...c, error: c.error ? String(c.error) : undefined })),
+                candidates: candidates.map((c) => ({
+                    ...c,
+                    nsPerOp: finite(c.nsPerOp),
+                    opsPerSec: finite(c.opsPerSec),
+                    vsFastest: finite(c.vsFastest),
+                    error: c.error ? String(c.error) : undefined,
+                })),
                 inputCount,
                 floorNs,
                 disagreements,
@@ -433,7 +519,7 @@ function printReport(report: Report, opts: { perInput?: boolean } = {}): void {
             fmtNs(c.nsPerOp),
             `±${spread}%`,
             fmtOps(c.opsPerSec),
-            c.vsFastest === 1 ? 'fastest' : `${round3(c.vsFastest)}× ${c.tiedWithNext ? '' : ''}`.trim(),
+            c.vsFastest === 1 ? (c.caveat ? '⚠ at floor' : 'fastest') : `${round3(c.vsFastest)}×`,
             c.agrees === false ? '✗ DISAGREES' : c.caveat ? `⚠ ${c.caveat}` : '',
         ]
     })

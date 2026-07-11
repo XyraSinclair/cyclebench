@@ -69,9 +69,13 @@ nanoseconds a harness measures itself, not your function. A naive loop
 timing two identical one-line additions reported **0.41ns vs 2.64ns — an
 "84% winner" between two copies of `a + b`** (the first was optimized
 away). cyclebench compiles per-arity trampolines that sink every result
-into an escaping ring buffer, measures its own floor with an empty function
-(~0.57ns), reports it on every run, and flags any candidate within 2× of it
-as unmeasurable rather than ranking it.
+into an escaping ring buffer, and measures its own floor with empty
+functions — per arity, through deliberately polymorphized call sites, so
+the floor reflects the overhead candidates actually face (~4ns; a naive
+monomorphic floor understates it ~7×). The floor is printed on every run,
+and any candidate within 2× of its arity's floor is caveated as
+unmeasurable — it still appears in the table, but it is never silently
+treated as a meaningful number ("⚠ at floor" instead of a crown).
 
 ## What a fair comparison means here
 
@@ -79,8 +83,12 @@ as unmeasurable rather than ranking it.
   (candidate × input) cell until each cell's time budget is met.
 - **Verified**: before measuring, every candidate runs once per input and
   the results are partitioned into equality classes; minority classes are
-  flagged, `report.ok` goes false, and the printout says so. Benchmarks
-  and correctness are one act, not two.
+  flagged, `report.ok` goes false, and the printout says so. When the top
+  classes tie in size (a 1-vs-1 disagreement), *all* sides are flagged —
+  no winner is blessed by insertion order. Benchmarks and correctness are
+  one act, not two. (A custom `agree` predicate must be an equivalence
+  relation; tolerance predicates aren't transitive and can make the
+  partition order-dependent.)
 - **A suite, not a point**: `inputs` is a list of argument tuples — measure
   the distribution you actually face. Per-input medians are reported
   (`report.candidates[i].perInput`), so crossovers are visible instead of

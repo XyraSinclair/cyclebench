@@ -57,6 +57,14 @@ round-robin cycles fit inside each weather regime. Per-slice ns/op values
 form the sample; the median is the estimator (robust to GC pauses landing
 inside a few slices) and the interquartile band is the reported spread.
 
+Round-robin over cells is fair in *turns*; fairness in *time* additionally
+requires slices to stay near the target. k (calls per slice) is therefore
+calibrated during warmup and **re-scaled after any measured slice that
+drifts beyond 0.5–2× the target** — calibration can run on a colder JIT
+tier than measurement (the function speeds up 5–10× after tier-up), and
+without adaptation those stale-k slices would both break interleaving
+fairness and overshoot the time budget.
+
 ### The hot loop
 
 Two lies to prevent: the engine deleting the workload, and the harness
@@ -67,19 +75,29 @@ dominating it.
   object cannot be proven dead, so the calls cannot be elided.
 - The loop is compiled per arity with `new Function` so arguments spread as
   a direct call — `fn.apply(fn, argsArray)` costs more than many functions
-  worth measuring. With the compiled trampoline the measured floor is
-  ~0.6ns/op on Apple Silicon under Node 24; under a CSP that bans
-  `unsafe-eval` the harness falls back to `apply` and the floor rises —
-  which is fine, because the floor is *measured*, not assumed.
+  worth measuring. With the compiled trampoline a virgin call site floors
+  at ~0.6ns/op on Apple Silicon under Node 24; the honest polymorphic
+  floor (see below) is ~4ns. Under a CSP that bans `unsafe-eval` the
+  harness falls back to `apply` and the floor rises — which is fine,
+  because the floor is *measured*, not assumed.
 
 ### The floor
 
-Before measuring candidates, the identical machinery times an empty
-function. That number is printed on every report and any candidate whose
-median lands within 2× of it gets a caveat instead of a ranking you might
-believe. A harness that doesn't know its own floor reports its own overhead
-as your function's speed — see `probes/dce.mjs`, where a naive loop
-reported `(a, b) => a + b` at 0.41ns/op (deleted) "beating" its twin by 84%.
+Before measuring candidates — but **after** their warmup, and after
+deliberately feeding each arity's trampoline two distinct empty functions —
+the identical machinery times an empty function per used arity. The
+ordering and the polymorphization are load-bearing: a floor taken through
+a virgin call site is monomorphic, gets inlined, and understates the real
+overhead about 7× (0.5ns vs 3.5ns measured), which would let
+harness-dominated candidates through uncaveated. Each cell is compared
+against its own arity's floor; the reported `floorNs` is the maximum
+across used arities. Any candidate with a cell median within 2× of its
+floor is caveated — it stays in the table, but the printout shows
+"⚠ at floor" instead of a crown, because at that scale the number is the
+harness, not the function. A harness that doesn't know its own floor
+reports its own overhead as your function's speed — see `probes/dce.mjs`,
+where a naive loop reported `(a, b) => a + b` at 0.41ns/op (deleted)
+"beating" its twin by 84%.
 
 ### Agreement
 
@@ -91,7 +109,11 @@ pluggable: `'deep'` (default — isoequal, because outputs containing cycles,
 Sets, or Maps must compare by structure, not insertion order), `'identity'`,
 a custom predicate, or `false` for candidates that are legitimately
 nondeterministic (then the check is off and the report says `agrees: null`,
-not a silent pass).
+not a silent pass). A custom predicate must be an equivalence relation —
+tolerance predicates are not transitive, and a non-transitive predicate
+makes the partition depend on candidate order. With a strict majority
+class, only the minorities are flagged; when the top classes tie in size
+there is no majority to bless, so every class is flagged.
 
 The agreement pass doubles as the DCE anchor: results that were compared
 for equality are results the engine had to actually produce.
@@ -154,8 +176,9 @@ polymorphic, so this is off by default and kept as an opt-in
 ## 4. Known limits
 
 - Warmup budgets well under ~100ms per candidate can straddle JIT tiers;
-  early slices then sample a colder tier. The median resists this, but for
-  sub-µs candidates keep the default budgets.
+  calibration on a cold tier then produces oversized early slices until the
+  adaptive re-scale corrects k (a few slices). The median resists the
+  transient, but for sub-µs candidates keep the default budgets.
 - Interleaving cancels drift *between* candidates; it cannot make an
   absolutely noisy machine precise — the spread column tells you what the
   run was worth.
@@ -172,5 +195,8 @@ Every claim above is executable:
 - `probes/disagreement.mjs` — the numeric-vs-lexicographic sort trap;
   ranking refused.
 - `probes/dce.mjs` — the naive 0.41ns "addition"; floor measured and shown.
-- `src/compare.test.ts` — 16 cases: ranking, agreement classes, async,
-  failure isolation, floor caveats, suite aggregation, formatting.
+- `src/compare.test.ts` — 22 cases: ranking, agreement classes (including
+  the no-majority tie), async, failure isolation (clean-pass and
+  late-throwing candidates), mutation detection (including the
+  uncloneable-insertion and mutate-on-repeat evasions), floor caveats,
+  suite aggregation, formatting.

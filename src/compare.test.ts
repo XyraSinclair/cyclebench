@@ -126,6 +126,65 @@ describe('failure and floor', () => {
         expect(report.ok).toBe(false)
     })
 
+    it('survives a candidate that throws only after the clean pass', async () => {
+        let calls = 0
+        const report = await compare({
+            candidates: {
+                fine: () => work(500),
+                statefulBomb: () => {
+                    if (++calls > 1) throw new Error('late boom')
+                    return work(500)
+                },
+            },
+            ...FAST,
+        })
+        expect(report.candidates.at(-1)!.name).toBe('statefulBomb')
+        expect(String(report.candidates.at(-1)!.error)).toContain('late boom')
+        expect(report.candidates[0].calls).toBeGreaterThan(0)
+        expect(report.ok).toBe(false)
+    })
+
+    it('a 1-vs-1 disagreement flags both sides, not whoever was listed second', async () => {
+        const report = await compare({
+            candidates: { alpha: () => 1, beta: () => 2 },
+            ...FAST,
+        })
+        const flags = report.candidates.map((c) => c.agrees)
+        expect(flags).toEqual([false, false])
+        const swapped = await compare({
+            candidates: { beta: () => 2, alpha: () => 1 },
+            ...FAST,
+        })
+        expect(swapped.candidates.map((c) => c.agrees)).toEqual([false, false])
+    })
+
+    it('a mutation that inserts an uncloneable value cannot disable its own detector', async () => {
+        await expect(
+            compare({
+                candidates: { sneaky: (xs: unknown[]) => xs.push(() => {}) },
+                inputs: [[[1, 2, 3]]],
+                ...FAST,
+            })
+        ).rejects.toThrow(/sneaky.*mutates/)
+    })
+
+    it('catches a candidate that mutates only on repeated calls', async () => {
+        let n = 0
+        await expect(
+            compare({
+                candidates: {
+                    slowBurn: (xs: number[]) => {
+                        n++
+                        if (n > 1) xs[0] = n // clean pass is honest; later calls mutate
+                        return xs.length
+                    },
+                },
+                inputs: [[[1, 2, 3]]],
+                ...FAST,
+            })
+        ).rejects.toThrow(/mutated during measurement/)
+    })
+
     it('flags calls too small to measure against the harness floor', async () => {
         const report = await compare({
             candidates: { tiny: (a: number, b: number) => a + b, alsoTiny: (a: number, b: number) => b + a },
