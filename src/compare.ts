@@ -161,8 +161,13 @@ interface Cand {
     agreementResults: unknown[] // one clean result per input
 }
 
+// The anti-DCE story, once: the agreement pass already proves every
+// candidate can produce real results, but only stores that escape protect
+// the measured loop itself from deletion. Every timed call's result lands
+// in this shared ring, and the ring escapes the module through _sinkProbe —
+// stores to an escaping object cannot be proven dead.
 const sink: unknown[] = new Array(64).fill(undefined)
-/** Read the sink so no engine can prove the stores dead. Exported for tests. */
+/** Reads a random ring slot, so the ring provably escapes. Tests also use it. */
 export function _sinkProbe(): unknown {
     return sink[(Math.random() * 64) | 0]
 }
@@ -524,15 +529,8 @@ function buildReport(
         const nsPerOp = cand.error && perInput.length === 0 ? NaN : mean((s) => s.nsPerOp)
         // Each cell answers to its own arity's floor (different arities have
         // genuinely different call overhead).
-        let cellFloor = NaN
-        const atFloor = own.some((c) => {
-            const floor = floorByArity.get(c.args.length) ?? floorNs
-            if (quartiles(c.samples).med < floor * 2) {
-                cellFloor = floor
-                return true
-            }
-            return false
-        })
+        const floorOf = (c: Cell) => floorByArity.get(c.args.length) ?? floorNs
+        const atFloorCell = own.find((c, i) => perInput[i].nsPerOp < floorOf(c) * 2)
         return {
             name: cand.name,
             isAsync: cand.isAsync,
@@ -547,15 +545,16 @@ function buildReport(
             tiedWithNext: false,
             agrees: cand.error || agree === false ? null : !disagreeing.has(cand.name),
             caveat:
-                !cand.error && atFloor
-                    ? `within 2× of the ${cellFloor.toFixed(2)}ns harness floor — call too small to compare reliably; give it bigger work`
+                !cand.error && atFloorCell
+                    ? `within 2× of the ${floorOf(atFloorCell).toFixed(2)}ns harness floor — call too small to compare reliably; give it bigger work`
                     : undefined,
         }
     })
 
-    results.sort(
-        (a, b) => Number(!!a.error) - Number(!!b.error) || a.nsPerOp - b.nsPerOp || 0
-    )
+    // Errored candidates sink to the bottom. Among them nsPerOp can be NaN
+    // (no samples), and a NaN from the comparator would corrupt the sort —
+    // the trailing || 0 pins such pairs as equal.
+    results.sort((a, b) => Number(!!a.error) - Number(!!b.error) || a.nsPerOp - b.nsPerOp || 0)
     // Multipliers are ratios to the fastest MEASURABLE candidate — a ratio
     // to a floor-level number would be a ratio to harness noise. A caveated
     // candidate can still rank first (its row says "⚠ at floor").
@@ -569,8 +568,7 @@ function buildReport(
         if (!a.error && !b.error) a.tiedWithNext = bandsOverlap(a.band, b.band)
     }
 
-    const ok =
-        disagreements.length === 0 && results.every((r) => !r.error)
+    const ok = disagreements.length === 0 && results.every((r) => !r.error)
 
     return {
         candidates: results,
@@ -602,8 +600,10 @@ function buildReport(
 }
 
 function printReport(report: Report, opts: { perInput?: boolean } = {}): void {
+    // Six columns; the unlabeled last one carries notes (disagreement,
+    // caveat, or an errored candidate's message).
     const rows = report.candidates.map((c) => {
-        if (c.error) return [c.name, 'ERROR', String(c.error).slice(0, 60), '', '']
+        if (c.error) return [c.name, 'ERROR', '', '', '', String(c.error).slice(0, 60)]
         const spread = c.band.med > 0 ? Math.round(((c.band.q3 - c.band.q1) / c.band.med) * 100) : 0
         return [
             c.name + (c.isAsync ? ' (async)' : ''),
@@ -615,8 +615,8 @@ function printReport(report: Report, opts: { perInput?: boolean } = {}): void {
         ]
     })
     const header = ['candidate', 'time/op', 'spread', 'ops/s', 'vs fastest', '']
-    const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)))
-    const line = (cols: string[]) => cols.map((c, i) => (c ?? '').padEnd(widths[i])).join('  ')
+    const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)))
+    const line = (cols: string[]) => cols.map((c, i) => c.padEnd(widths[i])).join('  ')
     console.log(line(header))
     console.log(widths.map((w) => '─'.repeat(w)).join('──'))
     for (let i = 0; i < rows.length; i++) {

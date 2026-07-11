@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { compare } from './compare.js'
+import { describe, expect, it, vi } from 'vitest'
+import { _sinkProbe, compare } from './compare.js'
 import { fmtNs, fmtOps, quartiles, round3 } from './stats.js'
 
 // Small budgets keep the suite fast; every assertion tolerates timer noise.
@@ -268,6 +268,34 @@ describe('report surface', () => {
             ...FAST,
         })
         report.print({ perInput: true })
+    })
+
+    it('print() puts an errored candidate\'s message in the notes column', async () => {
+        const report = await compare({
+            candidates: {
+                fine: () => work(500),
+                broken: () => {
+                    throw new Error('kaput')
+                },
+            },
+            ...FAST,
+        })
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+        let lines: string[]
+        try {
+            report.print()
+            lines = log.mock.calls.map((args) => args.join(' '))
+        } finally {
+            log.mockRestore() // also clears captured calls — read them first
+        }
+        const row = lines.find((l) => l.startsWith('broken'))!
+        expect(row).toContain('ERROR')
+        expect(row.indexOf('kaput')).toBeGreaterThan(row.indexOf('ERROR'))
+    })
+
+    it('the result ring is cleared after the run — outputs are not retained', async () => {
+        await compare({ candidates: { alloc: () => ({ keep: 'me?' }) }, ...FAST })
+        for (let i = 0; i < 64; i++) expect(_sinkProbe()).toBeUndefined()
     })
 })
 
