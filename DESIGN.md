@@ -192,8 +192,8 @@ polymorphic, so this is off by default and kept as an opt-in
 
 Every claim above is executable:
 
-- `probes/drift.mjs` — sequential says 1.90× between identical functions;
-  cyclebench says 1.04×, tie.
+- `probes/drift.mjs` — sequential says 1.95× between identical functions;
+  cyclebench says 1.03×, tie.
 - `probes/disagreement.mjs` — the numeric-vs-lexicographic sort trap;
   ranking refused.
 - `probes/dce.mjs` — the naive 0.41ns "addition"; floor measured and shown.

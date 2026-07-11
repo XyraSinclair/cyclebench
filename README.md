@@ -18,18 +18,18 @@ report.print()
 ```
 
 ```
-candidate  time/op  spread  ops/s   vs fastest
-───────────────────────────────────────────────
-viaSet     175µs    ±32%    5.7k/s  fastest
-native     6.31ms   ±3%     158/s   36×
-harness floor 0.587ns/op · 2 inputs · results agree
-viaSet: [0] 1.57µs  [1] 349µs
-native: [0] 1.8µs   [1] 12.6ms
+candidate  time/op  spread  ops/s    vs fastest
+────────────────────────────────────────────────
+viaSet     155µs    ±25%    6.47k/s  fastest
+native     5.95ms   ±1%     168/s    38.5×
+harness floor 3.53ns/op · 2 inputs · results agree
+viaSet: [0] 1.49µs  [1] 308µs
+native: [0] 1.72µs  [1] 11.9ms
 ```
 
 (Regenerate with `node probes/readme-example.mjs`. Note the per-input rows:
-at 100 elements the candidates are nearly tied; at 10,000 they are 36× apart
-— a single-input benchmark would have averaged that story away.)
+at 100 elements the candidates are nearly tied; at 10,000 they are ~39×
+apart — a single-input benchmark would have averaged that story away.)
 
 ## Why this library exists
 
@@ -43,8 +43,8 @@ background load, thermal state, GC pressure. Give a sequential harness two
 
 |  | first | second | verdict |
 |---|---|---|---|
-| sequential harness | 1.1µs | 2.1µs | "1.90× slower" — **a lie** |
-| cyclebench | 1.09µs | 1.13µs | 1.04×, statistical tie — the truth |
+| sequential harness | 1.1µs | 2.1µs | "1.95× slower" — **a lie** |
+| cyclebench | 2.0µs | 1.95µs | 1.03×, statistical tie — the truth |
 
 cyclebench runs every (candidate × input) cell in ~2ms slices, round-robin,
 so every candidate sees the same weather. This is the oldest idea in
@@ -58,11 +58,15 @@ answer and a wrong one. cyclebench deep-compares every candidate's outputs
 unordered outputs compare correctly) before ranking:
 
 ```
-numericSort  74.7µs   fastest
-defaultSort  121µs    1.62×       ✗ DISAGREES
+numericSort  66.4µs   fastest     ✗ DISAGREES
+defaultSort  112µs    1.69×       ✗ DISAGREES
 DISAGREEMENT on input 0: {numericSort} vs {defaultSort}
 report.ok === false
 ```
+
+(Both sides are flagged: with one candidate per equality class there is no
+majority to bless, and cyclebench refuses to let listing order pick the
+"right" answer.)
 
 **3. The JIT deletes your workload** (`node probes/dce.mjs`). Below a few
 nanoseconds a harness measures itself, not your function. A naive loop
