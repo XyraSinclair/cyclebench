@@ -150,7 +150,9 @@ A thenable first result marks the candidate async; its slices await each
 call. This measures real await/scheduler overhead, which is honest — an
 async wrapper *is* slower than a sync call, and pretending otherwise would
 require subtracting a number nobody can measure per-call. The report labels
-async candidates so cross-kind comparisons are read with open eyes.
+async candidates so cross-kind comparisons are read with open eyes. (Floor
+caveats effectively never fire for async candidates: the sync-measured
+floor is dwarfed by await overhead, which is honestly part of their time.)
 
 ### deopt
 

@@ -231,6 +231,13 @@ export async function compare(spec: CompareSpec): Promise<Report> {
         }
     }
     let beforeSnapshot = snapshot()
+    // Inputs with volatile getters serialize differently on every read; two
+    // honest snapshots differing means the check cannot distinguish
+    // volatility from mutation — disable it rather than blame a candidate.
+    if (beforeSnapshot !== undefined) {
+        const second = snapshot()
+        if (second === undefined || !isoEqual(beforeSnapshot, second)) beforeSnapshot = undefined
+    }
     const cands: Cand[] = []
     for (const [name, fn] of entries) {
         const cand: Cand = { name, fn, isAsync: false, agreementResults: [] }
@@ -323,17 +330,18 @@ export async function compare(spec: CompareSpec): Promise<Report> {
     // real overhead ~7×, which would let unmeasurably small candidates pass
     // uncaveated. Each used arity is first polymorphized with two distinct
     // empty functions, then timed with a third.
-    const emptyOfArity = (arity: number): AnyFn => {
-        const params = Array.from({ length: arity }, (_, j) => `x${j}`)
-        return new Function(...params, '') as AnyFn
-    }
+    // Polymorphization needs distinct function IDENTITIES at the call site,
+    // not arity-matched formals (a plain call ignores extra args) — fresh
+    // closures do the job with no code generation, so CSP/no-eval runtimes
+    // keep working (the trampoline itself already falls back to apply).
+    const freshEmpty = (): AnyFn => () => {}
     const floorByArity = new Map<number, number>()
     for (const arity of new Set(cells.map((c) => c.args.length))) {
         const dummyArgs = new Array(arity).fill(0)
         const run = sliceRunner(arity)
-        for (let i = 0; i < 2; i++) run(emptyOfArity(arity), dummyArgs, sink, 10_000)
+        for (let i = 0; i < 2; i++) run(freshEmpty(), dummyArgs, sink, 10_000)
         const floorCell = makeCell(
-            { name: '', fn: emptyOfArity(arity), isAsync: false, agreementResults: [] },
+            { name: '', fn: freshEmpty(), isAsync: false, agreementResults: [] },
             dummyArgs,
             0,
             0
@@ -442,9 +450,15 @@ function buildReport(
         const nsPerOp = cand.error && perInput.length === 0 ? NaN : mean((s) => s.nsPerOp)
         // Each cell answers to its own arity's floor (different arities have
         // genuinely different call overhead).
-        const atFloor = own.some(
-            (c) => quartiles(c.samples).med < (floorByArity.get(c.args.length) ?? floorNs) * 2
-        )
+        let cellFloor = NaN
+        const atFloor = own.some((c) => {
+            const floor = floorByArity.get(c.args.length) ?? floorNs
+            if (quartiles(c.samples).med < floor * 2) {
+                cellFloor = floor
+                return true
+            }
+            return false
+        })
         return {
             name: cand.name,
             isAsync: cand.isAsync,
@@ -460,7 +474,7 @@ function buildReport(
             agrees: cand.error || agree === false ? null : !disagreeing.has(cand.name),
             caveat:
                 !cand.error && atFloor
-                    ? `within 2× of the ${floorNs.toFixed(2)}ns harness floor — call too small to compare reliably; give it bigger work`
+                    ? `within 2× of the ${cellFloor.toFixed(2)}ns harness floor — call too small to compare reliably; give it bigger work`
                     : undefined,
         }
     })
@@ -468,7 +482,10 @@ function buildReport(
     results.sort(
         (a, b) => Number(!!a.error) - Number(!!b.error) || a.nsPerOp - b.nsPerOp || 0
     )
-    const fastest = results.find((r) => !r.error)
+    // Multipliers are ratios to the fastest MEASURABLE candidate — a ratio
+    // to a floor-level number would be a ratio to harness noise. A caveated
+    // candidate can still rank first (its row says "⚠ at floor").
+    const fastest = results.find((r) => !r.error && !r.caveat) ?? results.find((r) => !r.error)
     for (const r of results) {
         if (!r.error && fastest) r.vsFastest = r.nsPerOp / fastest.nsPerOp
     }
@@ -519,7 +536,7 @@ function printReport(report: Report, opts: { perInput?: boolean } = {}): void {
             fmtNs(c.nsPerOp),
             `±${spread}%`,
             fmtOps(c.opsPerSec),
-            c.vsFastest === 1 ? (c.caveat ? '⚠ at floor' : 'fastest') : `${round3(c.vsFastest)}×`,
+            c.caveat ? '⚠ at floor' : c.vsFastest === 1 ? 'fastest' : `${round3(c.vsFastest)}×`,
             c.agrees === false ? '✗ DISAGREES' : c.caveat ? `⚠ ${c.caveat}` : '',
         ]
     })
