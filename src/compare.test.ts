@@ -294,7 +294,10 @@ describe('report surface', () => {
         }
         const row = lines.find((l) => l.startsWith('broken'))!
         expect(row).toContain('ERROR')
-        expect(row.indexOf('kaput')).toBeGreaterThan(row.indexOf('ERROR'))
+        // The wide gap pins the NOTES-column placement: the old format put
+        // the message directly after ERROR in column 3; six-column rows
+        // leave ≥8 padded spaces between them.
+        expect(row).toMatch(/ERROR\s{8,}Error: kaput/)
     })
 
     it('the result ring is cleared after the run — outputs are not retained', async () => {
